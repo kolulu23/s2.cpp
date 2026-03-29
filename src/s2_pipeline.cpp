@@ -1,4 +1,5 @@
 #include "../include/s2_pipeline.h"
+#include "../include/s2_gguf.h"
 #include <cstdio>
 #include <cmath>
 
@@ -25,13 +26,21 @@ bool Pipeline::init(const PipelineParams & params) {
         return false;
     }
 
-    if (!model_.load(params.model_path, params.gpu_device, params.backend_type)) {
-        safe_print_error_ln("Pipeline error: could not load model from " + params.model_path);
+    // Load GGUF once and share between model and codec (reduces memory overhead)
+    auto loader = GGUFLoader::load(params.model_path);
+    if (!loader) {
+        safe_print_error_ln("Pipeline error: could not load GGUF from " + params.model_path);
         return false;
     }
 
-    if (!codec_.load(params.model_path, -1, -1)) {
-        safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
+    if (!model_.load_from_gguf_loader(*loader, params.gpu_device, params.backend_type)) {
+        safe_print_error_ln("Pipeline error: could not load model from GGUF");
+        return false;
+    }
+
+    // Codec always loads on CPU (gpu_device = -1)
+    if (!codec_.load_from_gguf_loader(*loader, -1, -1)) {
+        safe_print_error_ln("Pipeline error: could not load codec from GGUF");
         return false;
     }
 

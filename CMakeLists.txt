@@ -48,6 +48,10 @@ set(S2_SOURCES
     src/s2_pipeline.cpp
     src/s2_server.cpp
     src/s2_voice.cpp
+    src/s2_gguf.cpp
+    src/s2_backend.cpp
+    src/s2_gguf_metadata.cpp
+    src/s2_tensor_loader.cpp
     src/main.cpp
 )
 

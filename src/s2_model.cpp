@@ -12,6 +12,10 @@
 #  include <unistd.h>
 #endif
 
+#include "../include/s2_backend.h"
+#include "../include/s2_gguf_metadata.h"
+#include "../include/s2_tensor_loader.h"
+
 namespace s2 {
 
 // ---------------------------------------------------------------------------
@@ -96,127 +100,109 @@ SlowARModel::~SlowARModel() {
 // ---------------------------------------------------------------------------
 
 bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, int32_t backend_type) {
-    if (gpu_device >= 0) {
-#ifdef GGML_USE_VULKAN
-        if (!backend_ && backend_type == 0) {
-            backend_ = ggml_backend_vk_init(static_cast<size_t>(gpu_device));
-            if (!backend_) {
-                std::cerr << "[Model] Vulkan init failed, falling back to CPU." << std::endl;
-            }
-        }
-#endif
-#ifdef GGML_USE_CUDA
-        if (!backend_ && backend_type == 1) {
-            backend_ = ggml_backend_cuda_init(static_cast<size_t>(gpu_device));
-            if (!backend_) {
-                std::cerr << "[Model] Cuda init failed, falling back to CPU." << std::endl;
-            }
-        }
-#endif
-        if (!backend_) {
-            std::cerr << "[Model] NPU not compiled, falling back to CPU." << std::endl;
-        }
+    // Prevent double load
+    if (weights_.ctx_w) {
+        std::cerr << "[Model] Already loaded. Call reset() first.\n";
+        return false;
     }
-    if (!backend_) {
-        backend_ = ggml_backend_cpu_init();
-    }
+    
+    // Initialize backend
+    backend_ = BackendManager::init_backend(gpu_device, backend_type, backend_);
     if (!backend_) {
         std::cerr << "[Model] Failed to init any GGML backend." << std::endl;
         return false;
     }
-
+    
     allocr_      = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     fast_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
-
-    struct gguf_init_params params = { /*no_alloc=*/true, /*ctx=*/&weights_.ctx_w };
-    gguf_context * ctx_gguf = gguf_init_from_file(gguf_path.c_str(), params);
+    
+    // Track allocators for cleanup on failure
+    bool allocators_need_cleanup = true;
+    auto cleanup_allocators = [&]() {
+        if (allocators_need_cleanup) {
+            if (fast_allocr_) { ggml_gallocr_free(fast_allocr_); fast_allocr_ = nullptr; }
+            if (allocr_) { ggml_gallocr_free(allocr_); allocr_ = nullptr; }
+            allocators_need_cleanup = false;
+        }
+    };
+    
+    // Load GGUF file to read metadata
+    gguf_context* ctx_gguf = gguf_init_from_file(gguf_path.c_str(), gguf_init_params{/*no_alloc=*/true, /*ctx=*/nullptr});
     if (!ctx_gguf) {
         std::cerr << "[Model] Failed to load GGUF from " << gguf_path << std::endl;
+        cleanup_allocators();
         return false;
     }
-
+    
     std::cout << "[Model] Reading metadata from " << gguf_path << std::endl;
-
-    // Helpers to read GGUF metadata
-    auto get_u32 = [&](const char * key, uint32_t def) -> uint32_t {
-        int id = gguf_find_key(ctx_gguf, key);
-        if (id < 0) { std::cerr << "[GGUF] missing key: " << key << " (using default " << def << ")\n"; return def; }
-        uint32_t v = gguf_get_val_u32(ctx_gguf, id);
-        std::cout << "[GGUF] " << key << " = " << v << "\n";
-        return v;
-    };
-    auto get_f32 = [&](const char * key, float def) -> float {
-        int id = gguf_find_key(ctx_gguf, key);
-        if (id < 0) { std::cerr << "[GGUF] missing key: " << key << " (using default " << def << ")\n"; return def; }
-        float v = gguf_get_val_f32(ctx_gguf, id);
-        std::cout << "[GGUF] " << key << " = " << v << "\n";
-        return v;
-    };
-    auto get_bool = [&](const char * key, bool def) -> bool {
-        int id = gguf_find_key(ctx_gguf, key);
-        if (id < 0) { std::cerr << "[GGUF] missing key: " << key << " (using default " << (def?"true":"false") << ")\n"; return def; }
-        bool v = gguf_get_val_bool(ctx_gguf, id);
-        std::cout << "[GGUF] " << key << " = " << (v?"true":"false") << "\n";
-        return v;
-    };
-
+    
+    // Read metadata using GGUFMetadata helper
+    ModelMetadata meta;
+    try {
+        meta = GGUFMetadata::read_model_metadata(ctx_gguf);
+    } catch (const std::exception& e) {
+        std::cerr << "[Model] Failed to read GGUF metadata: " << e.what() << std::endl;
+        gguf_free(ctx_gguf);
+        cleanup_allocators();
+        return false;
+    }
+    
+    // Convert ModelMetadata to ModelHParams
     hparams_ = ModelHParams();
-
-    // Determine architecture prefix from the file
-    std::string arch_prefix = "fish-speech.";
-    {
-        int arch_id = gguf_find_key(ctx_gguf, "general.architecture");
-        if (arch_id >= 0) {
-            std::string arch = gguf_get_val_str(ctx_gguf, arch_id);
-            arch_prefix = arch + ".";
-            hparams_.has_fast_decoder = (arch == "fish-speech");
-            std::cout << "[Model] Architecture: " << arch << std::endl;
-        }
-    }
-
-    // Main model hparams (from arch-prefixed keys)
-    hparams_.context_length      = (int32_t)get_u32((arch_prefix + "context_length").c_str(), 32768);
-    hparams_.vocab_size          = (int32_t)get_u32((arch_prefix + "vocab_size").c_str(), 155776);
-    hparams_.embedding_length    = (int32_t)get_u32((arch_prefix + "embedding_length").c_str(), 2560);
-    hparams_.feed_forward_length = (int32_t)get_u32((arch_prefix + "feed_forward_length").c_str(), 9728);
-    hparams_.block_count         = (int32_t)get_u32((arch_prefix + "block_count").c_str(), 36);
-    hparams_.head_count          = (int32_t)get_u32((arch_prefix + "attention.head_count").c_str(), 32);
-    hparams_.head_count_kv       = (int32_t)get_u32((arch_prefix + "attention.head_count_kv").c_str(), 8);
-    hparams_.rope_freq_base      = get_f32((arch_prefix + "rope.freq_base").c_str(), 1e6f);
-    hparams_.rms_norm_eps        = get_f32((arch_prefix + "attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
-
-    // Fish-speech specific keys
-    hparams_.codebook_size            = (int32_t)get_u32("fish_speech.codebook_size", 4096);
-    hparams_.num_codebooks            = (int32_t)get_u32("fish_speech.num_codebooks", 10);
-    hparams_.semantic_begin_id        = (int32_t)get_u32("fish_speech.semantic_begin_id", 151678);
-    hparams_.semantic_end_id          = (int32_t)get_u32("fish_speech.semantic_end_id", 155773);
-    hparams_.tie_word_embeddings      = get_bool("fish_speech.tie_word_embeddings", true);
-    hparams_.attention_qk_norm        = get_bool("fish_speech.attention_qk_norm", false);
-    hparams_.scale_codebook_embeddings = get_bool("fish_speech.scale_codebook_embeddings", false);
-
-    // Fast decoder hparams
+    hparams_.context_length      = meta.context_length;
+    hparams_.vocab_size          = meta.vocab_size;
+    hparams_.embedding_length    = meta.embedding_length;
+    hparams_.feed_forward_length = meta.feed_forward_length;
+    hparams_.block_count         = meta.block_count;
+    hparams_.head_count          = meta.head_count;
+    hparams_.head_count_kv       = meta.head_count_kv;
+    hparams_.rope_freq_base      = meta.rope_freq_base;
+    hparams_.rms_norm_eps        = meta.rms_norm_eps;
+    hparams_.codebook_size       = meta.codebook_size;
+    hparams_.num_codebooks       = meta.num_codebooks;
+    hparams_.semantic_begin_id   = meta.semantic_begin_id;
+    hparams_.semantic_end_id     = meta.semantic_end_id;
+    hparams_.tie_word_embeddings = meta.tie_word_embeddings;
+    hparams_.attention_qk_norm   = meta.attention_qk_norm;
+    hparams_.scale_codebook_embeddings = meta.scale_codebook_embeddings;
+    hparams_.has_fast_decoder    = meta.has_fast_decoder;
+    
     if (hparams_.has_fast_decoder) {
-        hparams_.fast_context_length   = (int32_t)get_u32("fish_speech.fast_context_length", 11);
-        hparams_.fast_embedding_length = (int32_t)get_u32("fish_speech.fast_embedding_length", 2560);
-        hparams_.fast_feed_forward_length = (int32_t)get_u32("fish_speech.fast_feed_forward_length", 9728);
-        hparams_.fast_block_count      = (int32_t)get_u32("fish_speech.fast_block_count", 4);
-        hparams_.fast_head_count       = (int32_t)get_u32("fish_speech.fast_head_count", 32);
-        hparams_.fast_head_count_kv    = (int32_t)get_u32("fish_speech.fast_head_count_kv", 8);
-        hparams_.fast_head_dim         = (int32_t)get_u32("fish_speech.fast_head_dim", 128);
-        hparams_.fast_rope_freq_base   = get_f32("fish_speech.fast_rope_freq_base", 1e6f);
-        hparams_.fast_rms_norm_eps     = get_f32("fish_speech.fast_layer_norm_rms_eps", 1e-6f);
-        hparams_.fast_attention_qk_norm = get_bool("fish_speech.fast_attention_qk_norm", false);
-        hparams_.fast_has_project_in   = get_bool("fish_speech.fast_project_in", false);
+        hparams_.fast_context_length     = meta.fast_context_length;
+        hparams_.fast_embedding_length   = meta.fast_embedding_length;
+        hparams_.fast_feed_forward_length = meta.fast_feed_forward_length;
+        hparams_.fast_block_count        = meta.fast_block_count;
+        hparams_.fast_head_count         = meta.fast_head_count;
+        hparams_.fast_head_count_kv      = meta.fast_head_count_kv;
+        hparams_.fast_head_dim           = meta.fast_head_dim;
+        hparams_.fast_rope_freq_base     = meta.fast_rope_freq_base;
+        hparams_.fast_rms_norm_eps       = meta.fast_rms_norm_eps;
+        hparams_.fast_attention_qk_norm  = meta.fast_attention_qk_norm;
+        hparams_.fast_has_project_in     = meta.fast_has_project_in;
     }
-
+    
     std::cout << "[Model] Layers: " << hparams_.block_count
               << ", Dim: " << hparams_.embedding_length
               << ", Vocab: " << hparams_.vocab_size
               << ", head_count: " << hparams_.head_count
               << ", has_fast_decoder: " << hparams_.has_fast_decoder << std::endl;
-
+    
+    gguf_free(ctx_gguf); // No longer needed
+    
+    // Load tensors excluding codec prefix "c."
+    TensorContext tensor_ctx = TensorLoader::load_excluding_prefix(gguf_path, backend_, "c.");
+    if (!tensor_ctx.valid()) {
+        std::cerr << "[Model] Failed to load model tensors." << std::endl;
+        cleanup_allocators();
+        return false;
+    }
+    
+    // Transfer ownership to weights struct
+    weights_.ctx_w = tensor_ctx.release_context();
+    weights_.model_buf = tensor_ctx.release_buffer();
+    
     // ---------------------------------------------------------------------------
-    // Load tensor pointers (metadata only — data loaded below)
+    // Load tensor pointers (metadata only — data already loaded)
     // ---------------------------------------------------------------------------
     auto req_t = [&](const std::string & name) -> ggml_tensor * {
         ggml_tensor * t = ggml_get_tensor(weights_.ctx_w, name.c_str());
@@ -228,17 +214,17 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, int32_
     auto opt_t = [&](const std::string & name) -> ggml_tensor * {
         return ggml_get_tensor(weights_.ctx_w, name.c_str());
     };
-
+    
     try {
         weights_.embeddings          = req_t("embeddings.weight");
         weights_.codebook_embeddings = req_t("codebook_embeddings.weight");
         weights_.norm                = req_t("norm.weight");
-
+        
         weights_.layers.resize(hparams_.block_count);
         for (int32_t i = 0; i < hparams_.block_count; ++i) {
             auto & layer = weights_.layers[i];
             std::string stem = "layers." + std::to_string(i) + ".";
-
+            
             layer.attention_norm = req_t(stem + "attention_norm.weight");
             layer.ffn_norm       = req_t(stem + "ffn_norm.weight");
             layer.wqkv           = req_t(stem + "attention.wqkv.weight");
@@ -246,13 +232,13 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, int32_
             layer.w1             = req_t(stem + "feed_forward.w1.weight");
             layer.w2             = req_t(stem + "feed_forward.w2.weight");
             layer.w3             = req_t(stem + "feed_forward.w3.weight");
-
+            
             if (hparams_.attention_qk_norm) {
                 layer.q_norm = req_t(stem + "attention.q_norm.weight");
                 layer.k_norm = req_t(stem + "attention.k_norm.weight");
             }
         }
-
+        
         if (hparams_.has_fast_decoder) {
             if (hparams_.fast_has_project_in) {
                 weights_.fast_project_in = req_t("fast_project_in.weight");
@@ -260,12 +246,12 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, int32_
             weights_.fast_embeddings = req_t("fast_embeddings.weight");
             weights_.fast_norm       = req_t("fast_norm.weight");
             weights_.fast_output     = req_t("fast_output.weight");
-
+            
             weights_.fast_layers.resize(hparams_.fast_block_count);
             for (int32_t i = 0; i < hparams_.fast_block_count; ++i) {
                 auto & layer = weights_.fast_layers[i];
                 std::string stem = "fast_layers." + std::to_string(i) + ".";
-
+                
                 layer.attention_norm = req_t(stem + "attention_norm.weight");
                 layer.ffn_norm       = req_t(stem + "ffn_norm.weight");
                 layer.wqkv           = req_t(stem + "attention.wqkv.weight");
@@ -273,7 +259,7 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, int32_
                 layer.w1             = req_t(stem + "feed_forward.w1.weight");
                 layer.w2             = req_t(stem + "feed_forward.w2.weight");
                 layer.w3             = req_t(stem + "feed_forward.w3.weight");
-
+                
                 if (hparams_.fast_attention_qk_norm) {
                     layer.q_norm = req_t(stem + "attention.q_norm.weight");
                     layer.k_norm = req_t(stem + "attention.k_norm.weight");
@@ -282,68 +268,188 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, int32_
         }
     } catch (const std::exception & e) {
         std::cerr << "[Model] " << e.what() << std::endl;
-        gguf_free(ctx_gguf);
+        cleanup_allocators();
         return false;
     }
+    
+    // Tensor data already loaded by TensorLoader
+    std::cout << "[Model] Weights loaded." << std::endl;
+    allocators_need_cleanup = false; // ownership transferred to object
+    return true;
+}
 
-    // Allocate backend buffer for all weight tensors
-    weights_.model_buf = ggml_backend_alloc_ctx_tensors(weights_.ctx_w, backend_);
-    if (!weights_.model_buf) {
-        std::cerr << "[Model] Failed to allocate backend buffer for weights." << std::endl;
-        gguf_free(ctx_gguf);
+bool SlowARModel::load_from_gguf_loader(GGUFLoader & loader, int32_t gpu_device, int32_t backend_type) {
+    // Prevent double load
+    if (weights_.ctx_w) {
+        std::cerr << "[Model] Already loaded. Call reset() first.\n";
         return false;
     }
-
-    // Load tensor data from GGUF file
-    const size_t data_offset = gguf_get_data_offset(ctx_gguf);
-    const int64_t n_tensors  = gguf_get_n_tensors(ctx_gguf);
-    std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
-    if (!f) {
-        std::cerr << "[Model] Cannot reopen " << gguf_path << " for data loading." << std::endl;
-        gguf_free(ctx_gguf);
+    
+    // Initialize backend
+    backend_ = BackendManager::init_backend(gpu_device, backend_type, backend_);
+    if (!backend_) {
+        std::cerr << "[Model] Failed to init any GGML backend." << std::endl;
         return false;
     }
-    std::vector<uint8_t> tmp;
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * tname = gguf_get_tensor_name(ctx_gguf, ti);
-        ggml_tensor * t = ggml_get_tensor(weights_.ctx_w, tname);
-        if (!t) continue;
-        const size_t toff  = data_offset + gguf_get_tensor_offset(ctx_gguf, ti);
-        const size_t tsize = ggml_nbytes(t);
-        if (tmp.size() < tsize) tmp.resize(tsize);
-#ifdef _WIN32
-        _fseeki64(f, (int64_t)toff, SEEK_SET);
-#else
-        fseeko(f, (off_t)toff, SEEK_SET);
-#endif
-        if (std::fread(tmp.data(), 1, tsize, f) != tsize) {
-            std::cerr << "[Model] Failed to read tensor: " << tname << std::endl;
-            std::fclose(f);
-            gguf_free(ctx_gguf);
-            return false;
+    
+    allocr_      = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    fast_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    
+    // Track allocators for cleanup on failure
+    bool allocators_need_cleanup = true;
+    auto cleanup_allocators = [&]() {
+        if (allocators_need_cleanup) {
+            if (fast_allocr_) { ggml_gallocr_free(fast_allocr_); fast_allocr_ = nullptr; }
+            if (allocr_) { ggml_gallocr_free(allocr_); allocr_ = nullptr; }
+            allocators_need_cleanup = false;
         }
-        ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
+    };
+    
+    gguf_context* ctx_gguf = loader.get_gguf_context();
+    if (!ctx_gguf) {
+        std::cerr << "[Model] GGUFLoader has no gguf context." << std::endl;
+        cleanup_allocators();
+        return false;
     }
-    tmp.clear();
-    tmp.shrink_to_fit();
-    std::fclose(f);
-
-    // Advise the kernel to drop the file pages from page cache — the weights
-    // are now in the backend buffer (VRAM) and we no longer need the cached
-    // file data in RAM.
-#ifdef __linux__
-    {
-        int fd = ::open(gguf_path.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-            ::close(fd);
+    
+    std::cout << "[Model] Reading metadata from GGUF loader" << std::endl;
+    
+    // Read metadata using GGUFMetadata helper
+    ModelMetadata meta;
+    try {
+        meta = GGUFMetadata::read_model_metadata(ctx_gguf);
+    } catch (const std::exception& e) {
+        std::cerr << "[Model] Failed to read GGUF metadata: " << e.what() << std::endl;
+        cleanup_allocators();
+        return false;
+    }
+    
+    // Convert ModelMetadata to ModelHParams
+    hparams_ = ModelHParams();
+    hparams_.context_length      = meta.context_length;
+    hparams_.vocab_size          = meta.vocab_size;
+    hparams_.embedding_length    = meta.embedding_length;
+    hparams_.feed_forward_length = meta.feed_forward_length;
+    hparams_.block_count         = meta.block_count;
+    hparams_.head_count          = meta.head_count;
+    hparams_.head_count_kv       = meta.head_count_kv;
+    hparams_.rope_freq_base      = meta.rope_freq_base;
+    hparams_.rms_norm_eps        = meta.rms_norm_eps;
+    hparams_.codebook_size       = meta.codebook_size;
+    hparams_.num_codebooks       = meta.num_codebooks;
+    hparams_.semantic_begin_id   = meta.semantic_begin_id;
+    hparams_.semantic_end_id     = meta.semantic_end_id;
+    hparams_.tie_word_embeddings = meta.tie_word_embeddings;
+    hparams_.attention_qk_norm   = meta.attention_qk_norm;
+    hparams_.scale_codebook_embeddings = meta.scale_codebook_embeddings;
+    hparams_.has_fast_decoder    = meta.has_fast_decoder;
+    
+    if (hparams_.has_fast_decoder) {
+        hparams_.fast_context_length     = meta.fast_context_length;
+        hparams_.fast_embedding_length   = meta.fast_embedding_length;
+        hparams_.fast_feed_forward_length = meta.fast_feed_forward_length;
+        hparams_.fast_block_count        = meta.fast_block_count;
+        hparams_.fast_head_count         = meta.fast_head_count;
+        hparams_.fast_head_count_kv      = meta.fast_head_count_kv;
+        hparams_.fast_head_dim           = meta.fast_head_dim;
+        hparams_.fast_rope_freq_base     = meta.fast_rope_freq_base;
+        hparams_.fast_rms_norm_eps       = meta.fast_rms_norm_eps;
+        hparams_.fast_attention_qk_norm  = meta.fast_attention_qk_norm;
+        hparams_.fast_has_project_in     = meta.fast_has_project_in;
+    }
+    
+    std::cout << "[Model] Layers: " << hparams_.block_count
+              << ", Dim: " << hparams_.embedding_length
+              << ", Vocab: " << hparams_.vocab_size
+              << ", head_count: " << hparams_.head_count
+              << ", has_fast_decoder: " << hparams_.has_fast_decoder << std::endl;
+    
+    // Load tensors excluding codec prefix "c."
+    TensorContext tensor_ctx = TensorLoader::load_excluding_prefix(loader, backend_, "c.");
+    if (!tensor_ctx.valid()) {
+        std::cerr << "[Model] Failed to load model tensors." << std::endl;
+        cleanup_allocators();
+        return false;
+    }
+    
+    // Transfer ownership to weights struct
+    weights_.ctx_w = tensor_ctx.release_context();
+    weights_.model_buf = tensor_ctx.release_buffer();
+    
+    // ---------------------------------------------------------------------------
+    // Load tensor pointers (metadata only — data already loaded)
+    // ---------------------------------------------------------------------------
+    auto req_t = [&](const std::string & name) -> ggml_tensor * {
+        ggml_tensor * t = ggml_get_tensor(weights_.ctx_w, name.c_str());
+        if (!t) {
+            throw std::runtime_error("missing tensor: " + name);
         }
+        return t;
+    };
+    auto opt_t = [&](const std::string & name) -> ggml_tensor * {
+        return ggml_get_tensor(weights_.ctx_w, name.c_str());
+    };
+    
+    try {
+        weights_.embeddings          = req_t("embeddings.weight");
+        weights_.codebook_embeddings = req_t("codebook_embeddings.weight");
+        weights_.norm                = req_t("norm.weight");
+        
+        weights_.layers.resize(hparams_.block_count);
+        for (int32_t i = 0; i < hparams_.block_count; ++i) {
+            auto & layer = weights_.layers[i];
+            std::string stem = "layers." + std::to_string(i) + ".";
+            
+            layer.attention_norm = req_t(stem + "attention_norm.weight");
+            layer.ffn_norm       = req_t(stem + "ffn_norm.weight");
+            layer.wqkv           = req_t(stem + "attention.wqkv.weight");
+            layer.wo             = req_t(stem + "attention.wo.weight");
+            layer.w1             = req_t(stem + "feed_forward.w1.weight");
+            layer.w2             = req_t(stem + "feed_forward.w2.weight");
+            layer.w3             = req_t(stem + "feed_forward.w3.weight");
+            
+            if (hparams_.attention_qk_norm) {
+                layer.q_norm = req_t(stem + "attention.q_norm.weight");
+                layer.k_norm = req_t(stem + "attention.k_norm.weight");
+            }
+        }
+        
+        if (hparams_.has_fast_decoder) {
+            if (hparams_.fast_has_project_in) {
+                weights_.fast_project_in = req_t("fast_project_in.weight");
+            }
+            weights_.fast_embeddings = req_t("fast_embeddings.weight");
+            weights_.fast_norm       = req_t("fast_norm.weight");
+            weights_.fast_output     = req_t("fast_output.weight");
+            
+            weights_.fast_layers.resize(hparams_.fast_block_count);
+            for (int32_t i = 0; i < hparams_.fast_block_count; ++i) {
+                auto & layer = weights_.fast_layers[i];
+                std::string stem = "fast_layers." + std::to_string(i) + ".";
+                
+                layer.attention_norm = req_t(stem + "attention_norm.weight");
+                layer.ffn_norm       = req_t(stem + "ffn_norm.weight");
+                layer.wqkv           = req_t(stem + "attention.wqkv.weight");
+                layer.wo             = req_t(stem + "attention.wo.weight");
+                layer.w1             = req_t(stem + "feed_forward.w1.weight");
+                layer.w2             = req_t(stem + "feed_forward.w2.weight");
+                layer.w3             = req_t(stem + "feed_forward.w3.weight");
+                
+                if (hparams_.fast_attention_qk_norm) {
+                    layer.q_norm = req_t(stem + "attention.q_norm.weight");
+                    layer.k_norm = req_t(stem + "attention.k_norm.weight");
+                }
+            }
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "[Model] " << e.what() << std::endl;
+        cleanup_allocators();
+        return false;
     }
-#endif
-
-    std::cout << "[Model] Weights loaded. Total tensors: " << n_tensors << std::endl;
-
-    gguf_free(ctx_gguf);
+    
+    // Tensor data already loaded by TensorLoader
+    std::cout << "[Model] Weights loaded." << std::endl;
+    allocators_need_cleanup = false; // ownership transferred to object
     return true;
 }
 

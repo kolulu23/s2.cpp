@@ -10,6 +10,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
+#include "s2_gguf.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
@@ -96,6 +97,9 @@ public:
 
     // Load model from GGUF. gpu_device=-1 means CPU only.
     bool load(const std::string & gguf_path, int32_t gpu_device = -1, int32_t backend_type = -1);
+    
+    // Load model from an existing GGUFLoader (shared loader reduces memory overhead)
+    bool load_from_gguf_loader(GGUFLoader & loader, int32_t gpu_device = -1, int32_t backend_type = -1);
 
     // Initialize KV cache for generation
     bool init_kv_cache(int32_t max_seq_len);

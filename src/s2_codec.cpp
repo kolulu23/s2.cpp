@@ -1,4 +1,7 @@
 #include "../include/s2_codec.h"
+#include "../include/s2_backend.h"
+#include "../include/s2_gguf_metadata.h"
+#include "../include/s2_tensor_loader.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #elif defined GGML_USE_CUDA
@@ -668,153 +671,81 @@ AudioCodec::~AudioCodec() {
 // ---------------------------------------------------------------------------
 
 bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t backend_type) {
-    if (gpu_device >= 0) {
-#ifdef GGML_USE_VULKAN
-        if (!impl_->backend && backend_type == 0) {
-            impl_->backend = ggml_backend_vk_init(static_cast<size_t>(gpu_device));
-            if (!impl_->backend) {
-                std::cerr << "[Codec] Vulkan init failed, falling back to CPU." << std::endl;
-            }
-        }
-#endif
-#ifdef GGML_USE_CUDA
-        if (!impl_->backend && backend_type == 1) {
-            impl_->backend = ggml_backend_cuda_init(static_cast<size_t>(gpu_device));
-            if (!impl_->backend) {
-                std::cerr << "[Codec] Cuda init failed, falling back to CPU." << std::endl;
-            }
-        }
-#endif
+    // Prevent double load
+    if (impl_->ctx_w) {
+        std::cerr << "[Codec] Already loaded. Call reset() first.\n";
+        return false;
     }
-    if (!impl_->backend) impl_->backend = ggml_backend_cpu_init();
-    if (!impl_->backend) { std::cerr << "[Codec] No backend." << std::endl; return false; }
-
-    struct gguf_init_params params = { true, &impl_->ctx_w };
-    gguf_context * gguf_ctx = gguf_init_from_file(gguf_path.c_str(), params);
-    if (!gguf_ctx) { std::cerr << "[Codec] Failed to open " << gguf_path << std::endl; return false; }
-
+    
+    // Initialize backend
+    impl_->backend = BackendManager::init_backend(gpu_device, backend_type, impl_->backend);
+    if (!impl_->backend) {
+        std::cerr << "[Codec] Failed to init any GGML backend." << std::endl;
+        return false;
+    }
+    
+    // Open GGUF file for metadata only
+    gguf_context* ctx_gguf = gguf_init_from_file(gguf_path.c_str(), gguf_init_params{/*no_alloc=*/true, /*ctx=*/nullptr});
+    if (!ctx_gguf) {
+        std::cerr << "[Codec] Failed to open " << gguf_path << std::endl;
+        return false;
+    }
+    
     try {
-        auto req_str = [&](const char * k) -> std::string {
-            int id = gguf_find_key(gguf_ctx, k);
-            if (id < 0) throw std::runtime_error(std::string("missing key: ") + k);
-            return gguf_get_val_str(gguf_ctx, id);
-        };
-        auto req_u32 = [&](const char * k) -> uint32_t {
-            int id = gguf_find_key(gguf_ctx, k);
-            if (id < 0) throw std::runtime_error(std::string("missing key: ") + k);
-            return gguf_get_val_u32(gguf_ctx, id);
-        };
-        auto opt_u32 = [&](const char * k, uint32_t def) -> uint32_t {
-            int id = gguf_find_key(gguf_ctx, k);
-            return (id < 0) ? def : gguf_get_val_u32(gguf_ctx, id);
-        };
-        auto req_f32 = [&](const char * k) -> float {
-            int id = gguf_find_key(gguf_ctx, k);
-            if (id < 0) throw std::runtime_error(std::string("missing key: ") + k);
-            return gguf_get_val_f32(gguf_ctx, id);
-        };
-        auto req_i32_or_u32 = [&](const char * k) -> int32_t {
-            int id = gguf_find_key(gguf_ctx, k);
-            if (id < 0) throw std::runtime_error(std::string("missing key: ") + k);
-            auto type = gguf_get_kv_type(gguf_ctx, id);
-            if (type == GGUF_TYPE_INT32)  return gguf_get_val_i32(gguf_ctx, id);
-            if (type == GGUF_TYPE_UINT32) return static_cast<int32_t>(gguf_get_val_u32(gguf_ctx, id));
-            throw std::runtime_error(std::string("expected INT32/UINT32 for key: ") + k);
-        };
-        auto req_u32_arr = [&](const char * k) -> std::vector<int32_t> {
-            int id = gguf_find_key(gguf_ctx, k);
-            if (id < 0) throw std::runtime_error(std::string("missing key: ") + k);
-            auto type = gguf_get_arr_type(gguf_ctx, id);
-            size_t n = gguf_get_arr_n(gguf_ctx, id);
-            std::vector<int32_t> v(n);
-            if (type == GGUF_TYPE_UINT32) {
-                const auto * d = static_cast<const uint32_t *>(gguf_get_arr_data(gguf_ctx, id));
-                for (size_t i = 0; i < n; ++i) v[i] = static_cast<int32_t>(d[i]);
-            } else if (type == GGUF_TYPE_INT32) {
-                const auto * d = static_cast<const int32_t *>(gguf_get_arr_data(gguf_ctx, id));
-                for (size_t i = 0; i < n; ++i) v[i] = d[i];
-            } else if (type == GGUF_TYPE_UINT64) {
-                const auto * d = static_cast<const uint64_t *>(gguf_get_arr_data(gguf_ctx, id));
-                for (size_t i = 0; i < n; ++i) v[i] = static_cast<int32_t>(d[i]);
-            } else {
-                throw std::runtime_error(std::string("unexpected array type for key: ") + k);
-            }
-            return v;
-        };
-
-        const std::string arch = req_str("general.architecture");
-        if (arch == "fish-speech") {
-            impl_->tprefix = "c.";
-        } else if (arch == "fish-speech-codec") {
-            impl_->tprefix = "";
-        } else {
-            throw std::runtime_error("unexpected architecture: " + arch);
-        }
-
-        impl_->sample_rate    = static_cast<int32_t>(req_u32("fish_speech.codec.sample_rate"));
-        impl_->hop_length     = static_cast<int32_t>(req_u32("fish_speech.codec.hop_length"));
-        impl_->frame_length   = static_cast<int32_t>(opt_u32("fish_speech.codec.frame_length", 512));
-        impl_->encoder_dim    = static_cast<int32_t>(req_u32("fish_speech.codec.encoder_dim"));
-        impl_->decoder_dim    = static_cast<int32_t>(req_u32("fish_speech.codec.decoder_dim"));
-        impl_->latent_dim     = static_cast<int32_t>(req_u32("fish_speech.codec.latent_dim"));
-        impl_->encoder_rates  = req_u32_arr("fish_speech.codec.encoder_rates");
-        impl_->decoder_rates  = req_u32_arr("fish_speech.codec.decoder_rates");
-        impl_->encoder_transformer_layers = req_u32_arr("fish_speech.codec.encoder_transformer_layers");
-
-        impl_->quantizer_input_dim              = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_input_dim"));
-        impl_->quantizer_codebook_dim           = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_codebook_dim"));
-        impl_->quantizer_residual_codebooks     = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_residual_codebooks"));
-        impl_->quantizer_residual_codebook_size = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_residual_codebook_size"));
-        impl_->quantizer_semantic_codebook_size = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_semantic_codebook_size"));
-        impl_->quantizer_downsample_factor      = req_u32_arr("fish_speech.codec.quantizer_downsample_factor");
-
-        impl_->transformer_block_size    = static_cast<int32_t>(req_u32("fish_speech.codec.transformer.block_size"));
-        impl_->transformer_n_local_heads = req_i32_or_u32("fish_speech.codec.transformer.n_local_heads");
-        impl_->transformer_head_dim      = static_cast<int32_t>(req_u32("fish_speech.codec.transformer.head_dim"));
-        impl_->transformer_rope_base     = req_f32("fish_speech.codec.transformer.rope_freq_base");
-        impl_->transformer_norm_eps      = req_f32("fish_speech.codec.transformer.layer_norm_rms_eps");
-
-        impl_->rvq_transformer_window_size   = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.window_size"));
-        impl_->rvq_transformer_block_size    = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.block_size"));
-        impl_->rvq_transformer_n_layer       = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.n_layer"));
-        impl_->rvq_transformer_n_local_heads = req_i32_or_u32("fish_speech.codec.rvq_transformer.n_local_heads");
-        impl_->rvq_transformer_head_dim      = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.head_dim"));
-        impl_->rvq_transformer_dim           = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.dim"));
-        impl_->rvq_transformer_rope_base     = req_f32("fish_speech.codec.rvq_transformer.rope_freq_base");
-        impl_->rvq_transformer_norm_eps      = req_f32("fish_speech.codec.rvq_transformer.layer_norm_rms_eps");
-
+        // Read metadata using GGUFMetadata helper
+        CodecMetadata meta = GGUFMetadata::read_codec_metadata(ctx_gguf);
+        
+        // Copy metadata to impl struct
+        impl_->tprefix = meta.tensor_prefix;
+        impl_->sample_rate = meta.sample_rate;
+        impl_->hop_length = meta.hop_length;
+        impl_->frame_length = meta.frame_length;
+        impl_->encoder_dim = meta.encoder_dim;
+        impl_->decoder_dim = meta.decoder_dim;
+        impl_->latent_dim = meta.latent_dim;
+        impl_->encoder_rates = meta.encoder_rates;
+        impl_->decoder_rates = meta.decoder_rates;
+        impl_->encoder_transformer_layers = meta.encoder_transformer_layers;
+        
+        impl_->quantizer_input_dim = meta.quantizer_input_dim;
+        impl_->quantizer_codebook_dim = meta.quantizer_codebook_dim;
+        impl_->quantizer_residual_codebooks = meta.quantizer_residual_codebooks;
+        impl_->quantizer_residual_codebook_size = meta.quantizer_residual_codebook_size;
+        impl_->quantizer_semantic_codebook_size = meta.quantizer_semantic_codebook_size;
+        impl_->quantizer_downsample_factor = meta.quantizer_downsample_factor;
+        
+        impl_->transformer_block_size = meta.transformer_block_size;
+        impl_->transformer_n_local_heads = meta.transformer_n_local_heads;
+        impl_->transformer_head_dim = meta.transformer_head_dim;
+        impl_->transformer_rope_base = meta.transformer_rope_base;
+        impl_->transformer_norm_eps = meta.transformer_norm_eps;
+        
+        impl_->rvq_transformer_window_size = meta.rvq_transformer_window_size;
+        impl_->rvq_transformer_block_size = meta.rvq_transformer_block_size;
+        impl_->rvq_transformer_n_layer = meta.rvq_transformer_n_layer;
+        impl_->rvq_transformer_n_local_heads = meta.rvq_transformer_n_local_heads;
+        impl_->rvq_transformer_head_dim = meta.rvq_transformer_head_dim;
+        impl_->rvq_transformer_dim = meta.rvq_transformer_dim;
+        impl_->rvq_transformer_rope_base = meta.rvq_transformer_rope_base;
+        impl_->rvq_transformer_norm_eps = meta.rvq_transformer_norm_eps;
+        
         sample_rate_    = impl_->sample_rate;
         hop_length_     = impl_->hop_length;
         num_codebooks_  = impl_->quantizer_residual_codebooks + 1;
-
-        // Allocate and load tensor data
-        impl_->model_buf = ggml_backend_alloc_ctx_tensors(impl_->ctx_w, impl_->backend);
-        if (!impl_->model_buf) throw std::runtime_error("ggml_backend_alloc_ctx_tensors() failed");
-
-        const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-        const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
-        std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
-        if (!f) throw std::runtime_error("failed to reopen codec file");
-        for (int64_t ti = 0; ti < n_tensors; ++ti) {
-            const char * name = gguf_get_tensor_name(gguf_ctx, ti);
-            ggml_tensor * t = ggml_get_tensor(impl_->ctx_w, name);
-            if (!t) continue;
-            const size_t off   = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
-            const size_t nbytes = ggml_nbytes(t);
-            std::vector<uint8_t> tmp(nbytes);
-#ifdef _WIN32
-            _fseeki64(f, (int64_t)off, SEEK_SET);
-#else
-            fseeko(f, (off_t)off, SEEK_SET);
-#endif
-            if (std::fread(tmp.data(), 1, nbytes, f) != nbytes) {
-                std::fclose(f);
-                throw std::runtime_error(std::string("failed to read tensor: ") + name);
-            }
-            ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
+        
+        gguf_free(ctx_gguf); // No longer needed
+        
+        // Load tensors using TensorLoader
+        TensorContext tensor_ctx = TensorLoader::load_from_file(gguf_path, impl_->backend, impl_->tprefix);
+        if (!tensor_ctx.valid()) {
+            std::cerr << "[Codec] Failed to load codec tensors." << std::endl;
+            return false;
         }
-        std::fclose(f);
-
+        
+        // Transfer ownership to impl struct
+        impl_->ctx_w = tensor_ctx.release_context();
+        impl_->model_buf = tensor_ctx.release_buffer();
+        
         // Load VQ caches (CPU copies of codebooks)
         impl_->semantic_vq = load_vq_cache(impl_->ctx_w,
             impl_->tprefix + "quantizer.semantic_quantizer.quantizers.0",
@@ -827,13 +758,114 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t
                 impl_->quantizer_input_dim, impl_->quantizer_codebook_dim,
                 impl_->quantizer_residual_codebook_size));
         }
+        
+        std::cout << "[Codec] Weights loaded." << std::endl;
+        return true;
+        
     } catch (const std::exception & e) {
         std::cerr << "[Codec] " << e.what() << std::endl;
-        gguf_free(gguf_ctx);
+        gguf_free(ctx_gguf);
         return false;
     }
-    gguf_free(gguf_ctx);
-    return true;
+}
+
+// ---------------------------------------------------------------------------
+// load_from_gguf_loader()
+// ---------------------------------------------------------------------------
+
+bool AudioCodec::load_from_gguf_loader(GGUFLoader & loader, int32_t gpu_device, int32_t backend_type) {
+    // Prevent double load
+    if (impl_->ctx_w) {
+        std::cerr << "[Codec] Already loaded. Call reset() first.\n";
+        return false;
+    }
+    
+    // Initialize backend
+    impl_->backend = BackendManager::init_backend(gpu_device, backend_type, impl_->backend);
+    if (!impl_->backend) {
+        std::cerr << "[Codec] Failed to init any GGML backend." << std::endl;
+        return false;
+    }
+    
+    gguf_context* ctx_gguf = loader.get_gguf_context();
+    if (!ctx_gguf) {
+        std::cerr << "[Codec] GGUFLoader has no gguf context." << std::endl;
+        return false;
+    }
+    
+    try {
+        // Read metadata using GGUFMetadata helper
+        CodecMetadata meta = GGUFMetadata::read_codec_metadata(ctx_gguf);
+        
+        // Copy metadata to impl struct
+        impl_->tprefix = meta.tensor_prefix;
+        impl_->sample_rate = meta.sample_rate;
+        impl_->hop_length = meta.hop_length;
+        impl_->frame_length = meta.frame_length;
+        impl_->encoder_dim = meta.encoder_dim;
+        impl_->decoder_dim = meta.decoder_dim;
+        impl_->latent_dim = meta.latent_dim;
+        impl_->encoder_rates = meta.encoder_rates;
+        impl_->decoder_rates = meta.decoder_rates;
+        impl_->encoder_transformer_layers = meta.encoder_transformer_layers;
+        
+        impl_->quantizer_input_dim = meta.quantizer_input_dim;
+        impl_->quantizer_codebook_dim = meta.quantizer_codebook_dim;
+        impl_->quantizer_residual_codebooks = meta.quantizer_residual_codebooks;
+        impl_->quantizer_residual_codebook_size = meta.quantizer_residual_codebook_size;
+        impl_->quantizer_semantic_codebook_size = meta.quantizer_semantic_codebook_size;
+        impl_->quantizer_downsample_factor = meta.quantizer_downsample_factor;
+        
+        impl_->transformer_block_size = meta.transformer_block_size;
+        impl_->transformer_n_local_heads = meta.transformer_n_local_heads;
+        impl_->transformer_head_dim = meta.transformer_head_dim;
+        impl_->transformer_rope_base = meta.transformer_rope_base;
+        impl_->transformer_norm_eps = meta.transformer_norm_eps;
+        
+        impl_->rvq_transformer_window_size = meta.rvq_transformer_window_size;
+        impl_->rvq_transformer_block_size = meta.rvq_transformer_block_size;
+        impl_->rvq_transformer_n_layer = meta.rvq_transformer_n_layer;
+        impl_->rvq_transformer_n_local_heads = meta.rvq_transformer_n_local_heads;
+        impl_->rvq_transformer_head_dim = meta.rvq_transformer_head_dim;
+        impl_->rvq_transformer_dim = meta.rvq_transformer_dim;
+        impl_->rvq_transformer_rope_base = meta.rvq_transformer_rope_base;
+        impl_->rvq_transformer_norm_eps = meta.rvq_transformer_norm_eps;
+        
+        sample_rate_    = impl_->sample_rate;
+        hop_length_     = impl_->hop_length;
+        num_codebooks_  = impl_->quantizer_residual_codebooks + 1;
+        
+        // Load tensors using TensorLoader
+        TensorContext tensor_ctx = TensorLoader::load_from_loader(loader, impl_->backend, impl_->tprefix);
+        if (!tensor_ctx.valid()) {
+            std::cerr << "[Codec] Failed to load codec tensors." << std::endl;
+            return false;
+        }
+        
+        // Transfer ownership to impl struct
+        impl_->ctx_w = tensor_ctx.release_context();
+        impl_->model_buf = tensor_ctx.release_buffer();
+        
+        // Load VQ caches (CPU copies of codebooks)
+        impl_->semantic_vq = load_vq_cache(impl_->ctx_w,
+            impl_->tprefix + "quantizer.semantic_quantizer.quantizers.0",
+            impl_->quantizer_input_dim, impl_->quantizer_codebook_dim,
+            impl_->quantizer_semantic_codebook_size);
+        impl_->residual_vq.reserve(impl_->quantizer_residual_codebooks);
+        for (int32_t i = 0; i < impl_->quantizer_residual_codebooks; ++i) {
+            impl_->residual_vq.push_back(load_vq_cache(impl_->ctx_w,
+                impl_->tprefix + "quantizer.quantizer.quantizers." + std::to_string(i),
+                impl_->quantizer_input_dim, impl_->quantizer_codebook_dim,
+                impl_->quantizer_residual_codebook_size));
+        }
+        
+        std::cout << "[Codec] Weights loaded." << std::endl;
+        return true;
+        
+    } catch (const std::exception & e) {
+        std::cerr << "[Codec] " << e.what() << std::endl;
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
