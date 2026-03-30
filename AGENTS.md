@@ -76,6 +76,7 @@ s2.cpp implements a **Dual‑Autoregressive (Dual‑AR) text‑to‑speech infer
 ### Core Pipeline
 ```
 Text → Tokenizer → Prompt Builder → Slow‑AR Transformer → Fast‑AR Decoder → Audio Codec → WAV
+                  \-> Shared GGUF metadata + filtered tensor loading
 ```
 
 ### Key Components
@@ -100,7 +101,7 @@ Text → Tokenizer → Prompt Builder → Slow‑AR Transformer → Fast‑AR De
 5. **Audio Codec** (`s2_codec.cpp`):  
    - Convolutional encoder/decoder with RVQ (10 codebooks × 4096 entries).  
    - Encodes reference audio to codes; decodes generated codes to 44.1 kHz mono waveform.  
-   - Always runs on CPU (tiny workload).
+   - In the pipeline, codec weights are loaded from the same GGUF as the model via the shared loader, but execution still uses a CPU backend.
 
 6. **Generation Loop** (`s2_generate.cpp`):  
    - Manages the autoregressive loop: prefill → while not EOS → sample semantic token → fast‑decode codebooks → store frame → step.  
@@ -108,8 +109,24 @@ Text → Tokenizer → Prompt Builder → Slow‑AR Transformer → Fast‑AR De
    - Uses top‑k + top‑p + temperature sampling matching Fish‑Speech.
 
 7. **Pipeline** (`s2_pipeline.cpp`):  
-   - Top‑level orchestrator: initializes tokenizer, model, codec; handles voice‑cloning flow; applies post‑processing (normalization, silence trimming).  
+   - Top‑level orchestrator: initializes tokenizer, shared GGUF loader, model, and codec; handles voice‑cloning flow and optional voice profile persistence; applies post‑processing (normalization, silence trimming).  
    - **HTTP server** (`s2_server.cpp`) exposes a `/generate` endpoint for remote synthesis.
+
+8. **Shared GGUF Loader** (`s2_gguf.cpp`, `s2_tensor_loader.cpp`):  
+   - Loads GGUF metadata once, then builds filtered ggml contexts for either the model tensors or the codec tensors.  
+   - Avoids allocating codec tensors into the transformer backend buffer, reducing peak weight memory.
+
+9. **GGUF Metadata Helpers** (`s2_gguf_metadata.cpp`):  
+   - Centralizes GGUF key parsing, type conversion, and architecture detection for unified model vs standalone codec files.  
+   - Keeps model and codec loaders aligned on the same metadata rules.
+
+10. **Backend Manager** (`s2_backend.cpp`):  
+   - Centralizes GGML backend initialization and fallback logic for CPU, Vulkan, and CUDA.  
+   - Keeps model and codec backend setup consistent.
+
+11. **Voice Profile Persistence** (`s2_voice.cpp`):  
+   - Stores encoded prompt codes plus transcript in `.s2voice` files for reuse with `--voice <id>`.  
+   - Performs lightweight compatibility checks against the current model and codec settings.
 
 ### Dual‑AR Design Rationale
 - **Slow‑AR**: models long‑range linguistic dependencies (one semantic token per ~21.5 ms frame).  
@@ -118,8 +135,9 @@ Text → Tokenizer → Prompt Builder → Slow‑AR Transformer → Fast‑AR De
 
 ### Memory & Execution Model
 - Uses **GGML** tensors and allocators.  
-- Separate allocators for: KV‑cache (persistent), Slow‑AR compute buffer, Fast‑AR compute buffer, prefill temporary buffer.  
-- GPU backends run the transformer; codec stays on CPU.  
+- Loads GGUF metadata once in the pipeline, then creates separate filtered tensor contexts for transformer weights and codec weights.  
+- Separate allocators for: model weights buffer, codec weights buffer, KV‑cache (persistent), Slow‑AR compute buffer, Fast‑AR compute buffer, and prefill temporary buffer.  
+- GPU backends run the transformer; the codec path is loaded through the same GGUF but executed on CPU in the pipeline.  
 - **posix_fadvise(DONTNEED)** on Linux to drop GGUF file from page cache after loading weights.
 
 ### File Structure
@@ -135,6 +153,11 @@ src/                     # Implementations
 ├── s2_sampler.cpp      # Sampling utilities
 ├── s2_audio.cpp        # WAV I/O & audio processing
 ├── s2_server.cpp       # HTTP server
+├── s2_voice.cpp        # Voice profile persistence
+├── s2_gguf.cpp         # Shared GGUF loader
+├── s2_gguf_metadata.cpp # GGUF metadata helpers
+├── s2_tensor_loader.cpp # Filtered tensor loading helpers
+├── s2_backend.cpp      # Backend initialization helpers
 └── main.cpp            # CLI entry‑point
 ```
 
@@ -152,6 +175,7 @@ src/                     # Implementations
 
 ### When Modifying
 - The **GGUF file** contains both transformer weights and codec tensors (`c.*` prefix).  
+- Pipeline initialization now prefers loading GGUF once and splitting tensor ownership through `GGUFLoader`/`TensorLoader`.  
 - Adding new source files requires updating `CMakeLists.txt` `S2_SOURCES`.  
 - Follow existing patterns for error handling (`bool` returns, `std::runtime_error` for fatal errors).  
 - Use GPU backend guards (`#ifdef GGML_USE_VULKAN`, `GGML_USE_CUDA`).
