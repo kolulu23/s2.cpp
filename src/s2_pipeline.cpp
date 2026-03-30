@@ -150,6 +150,10 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
     }
 
     model_.clear_kv_cache();
+    struct KvCacheGuard {
+        SlowARModel & model;
+        ~KvCacheGuard() { model.clear_kv_cache(); }
+    } kv_cache_guard{model_};
 
     safe_print_ln("--- Pipeline Synthesize ---");
     safe_print_ln("Text: " + params.text);
@@ -223,7 +227,6 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
         return false;
     }
 
-    model_.clear_kv_cache();
     return true;
 }
 

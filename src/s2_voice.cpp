@@ -69,6 +69,25 @@ VoiceProfile VoiceProfile::load(const std::string & path) {
     
     uint64_t codes_size;
     in.read(reinterpret_cast<char*>(&codes_size), sizeof(codes_size));
+    // Some defensive checks
+    if (!in) throw std::runtime_error("truncated voice profile header");
+
+    const std::streamoff payload_offset = in.tellg();
+    in.seekg(0, std::ios::end);
+    const std::streamoff file_size = in.tellg();
+    in.seekg(payload_offset, std::ios::beg);
+
+    if (payload_offset < 0 || file_size < payload_offset) {
+        throw std::runtime_error("invalid voice profile size");
+    }
+
+    const uint64_t remaining_bytes = static_cast<uint64_t>(file_size - payload_offset);
+    if (transcript_len == 0 || transcript_len > remaining_bytes) {
+        throw std::runtime_error("invalid transcript length");
+    }
+    if ((codes_size % sizeof(int32_t)) != 0 || codes_size > remaining_bytes - transcript_len) {
+        throw std::runtime_error("invalid codes size");
+    }
     
     // Read transcript
     std::vector<char> transcript_buf(transcript_len);

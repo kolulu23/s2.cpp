@@ -11,3 +11,4 @@ compile_commands.json
 ref_audio.*
 ref_text.*
 /voices
+.vscode/
