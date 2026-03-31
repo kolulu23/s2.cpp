@@ -241,6 +241,7 @@ Start the server:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `text` | string | yes | Text to synthesize |
+| `voice` | string | no | Saved voice profile id to reuse. Alias: `voice_id`. If reference audio is also provided, the uploaded reference audio takes precedence |
 | `reference` | file | no | Reference audio file for voice cloning (WAV or MP3). Aliases: `reference_audio`, `prompt_audio`, `ref_audio` |
 | `reference_text` | string | if reference audio is provided | Transcript of the reference audio. Aliases: `ref_text`, `prompt_text` |
 | `params` | JSON string | no | Generation params: `max_new_tokens`, `temperature`, `top_p`, `top_k`, `min_tokens_before_end`, `n_threads`, `verbose` |
@@ -268,6 +269,31 @@ curl -X POST http://127.0.0.1:3030/generate \
   --form "ref_text=Transcript of the reference." \
   --form "text=Text to synthesize in that voice." \
   -o output.wav
+
+# Reuse a previously cloned voice profile
+curl -X POST http://127.0.0.1:3030/generate \
+  --form "voice=alice" \
+  --form "text=Text to synthesize in that saved voice." \
+  -o output.wav
+```
+
+**`POST /clone`** — create a persistent voice profile (multipart/form-data)
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `title` | string | yes | Human-readable title for the cloned voice. Used to derive the saved voice id |
+| `file` | file | yes | Reference audio file to encode into a `.s2voice` profile. Aliases: `reference`, `reference_audio`, `prompt_audio`, `ref_audio` |
+| `transcript` | string | yes | Transcript of the uploaded reference audio. Aliases: `reference_text`, `ref_text`, `prompt_text` |
+
+Returns `application/json` with the generated `voice_id` plus clone metadata such as profile size and elapsed time.
+
+The returned `voice_id` is exactly the submitted `title`, and the saved profile filename is `title.s2voice`. Reusing the same title overwrites the existing saved profile.
+
+```bash
+curl -X POST http://127.0.0.1:3030/clone \
+  --form "title=alice" \
+  --form "file=@reference.wav" \
+  --form "transcript=Transcript of the reference audio."
 ```
 
 ---

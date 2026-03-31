@@ -33,6 +33,20 @@ struct PipelineParams {
     std::string voice_storage_dir = "./voices"; // where profiles are stored
 };
 
+struct VoiceCloneResult {
+    std::string voice_id;
+    std::string title;
+    int64_t created_at = 0;
+    std::string profile_filename;
+    std::string storage_path;
+    size_t profile_size_bytes = 0;
+    size_t transcript_bytes = 0;
+    int32_t prompt_frames = 0;
+    int32_t sample_rate = 0;
+    int32_t codebook_size = 0;
+    int32_t num_codebooks = 0;
+};
+
 class Pipeline {
 public:
     Pipeline();
@@ -42,6 +56,12 @@ public:
     bool synthesize(const PipelineParams & params);
 
     bool synthesize_to_memory(const PipelineParams & params, void** ref_audio_buffer, size_t* ref_audio_size, void** wav_buffer, size_t* wav_size);
+    bool clone_voice_from_memory(const PipelineParams & params,
+                                 const void * ref_audio_buffer,
+                                 size_t ref_audio_size,
+                                 const std::string & voice_title,
+                                 const std::string & transcript,
+                                 VoiceCloneResult & result);
     bool synthesize_raw(const PipelineParams & params, AudioData & ref_audio, std::vector<float> & audio_out);
 
 private:

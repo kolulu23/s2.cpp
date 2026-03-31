@@ -2,6 +2,9 @@
 #include "../third_party/json.hpp"
 // #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "../include/s2_server.h"
+
+#include <algorithm>
+#include <chrono>
 #include <iostream>
 
 // httplib::SSLServer svr;
@@ -10,6 +13,10 @@ using json = nlohmann::json;
 
 namespace s2
 {
+    static json json_error(const std::string & message) {
+        return json{{"error", message}};
+    }
+
     static std::string get_first_form_field(const httplib::MultipartFormData& form,
                                             const std::initializer_list<const char*>& keys) {
         for (const char* key : keys) {
@@ -30,6 +37,56 @@ namespace s2
             }
         }
         return false;
+    }
+
+    static bool apply_generate_params_json(const std::string & params_json,
+                                           PipelineParams & pipeline_params,
+                                           std::string & error_message) {
+        try {
+            auto j = json::parse(params_json);
+
+            if (j.contains("max_new_tokens")) {
+                int32_t val = j["max_new_tokens"].get<int32_t>();
+                pipeline_params.gen.max_new_tokens = std::max(0, val);
+            }
+
+            if (j.contains("temperature")) {
+                float val = j["temperature"].get<float>();
+                pipeline_params.gen.temperature = std::max(0.0f, val);
+            }
+
+            if (j.contains("top_p")) {
+                float val = j["top_p"].get<float>();
+                pipeline_params.gen.top_p = std::max(0.0f, val);
+            }
+
+            if (j.contains("top_k")) {
+                int32_t val = j["top_k"].get<int32_t>();
+                pipeline_params.gen.top_k = std::max(0, val);
+            }
+
+            if (j.contains("min_tokens_before_end")) {
+                int32_t val = j["min_tokens_before_end"].get<int32_t>();
+                pipeline_params.gen.min_tokens_before_end = std::max(0, val);
+            }
+
+            if (j.contains("n_threads")) {
+                int32_t val = j["n_threads"].get<int32_t>();
+                pipeline_params.gen.n_threads = std::max(1, val);
+            }
+
+            if (j.contains("verbose")) {
+                pipeline_params.gen.verbose = j["verbose"].get<bool>();
+            }
+
+            return true;
+        } catch (const json::parse_error &) {
+            error_message = "JSON parse error";
+            return false;
+        } catch (const json::type_error &) {
+            error_message = "Invalid params JSON types";
+            return false;
+        }
     }
 
     Server::Server() {}
@@ -71,64 +128,29 @@ namespace s2
 
         svr.Post("/generate", [&](const httplib::Request& req, httplib::Response& res)
             {
-                PipelineParams pipelineParams;
-                pipelineParams.gen = params.pipeline.gen;
+                PipelineParams pipelineParams = params.pipeline;
+                pipelineParams.save_voice = false;
 
                 if (!req.form.has_field("text"))
                 {
-                    json err = { {"error", "No text field in multipart form"} };
+                    json err = json_error("No text field in multipart form");
                     res.set_content(err.dump(), "application/json");
                     res.status = 400;
                     return;
                 }
 
                 pipelineParams.text = req.form.get_field("text");
+                pipelineParams.voice_id = get_first_form_field(
+                    req.form, {"voice", "voice_id"});
 
                 pipelineParams.prompt_text = get_first_form_field(
                     req.form, {"reference_text", "ref_text", "prompt_text"});
 
                 if (req.form.has_field("params"))
                 {
-                    try {
-                        auto j = json::parse(req.form.get_field("params"));
-
-                        if (j.contains("max_new_tokens")) {
-                            int32_t val = j["max_new_tokens"].get<int32_t>();
-                            pipelineParams.gen.max_new_tokens = std::max(0, val);
-                        }
-
-                        if (j.contains("temperature")) {
-                            float val = j["temperature"].get<float>();
-                            pipelineParams.gen.temperature = std::max(0.0f, val);
-                        }
-
-                        if (j.contains("top_p")) {
-                            float val = j["top_p"].get<float>();
-                            pipelineParams.gen.top_p = std::max(0.0f, val);
-                        }
-
-                        if (j.contains("top_k")) {
-                            int32_t val = j["top_k"].get<int32_t>();
-                            pipelineParams.gen.top_k = std::max(0, val);
-                        }
-
-                        if (j.contains("min_tokens_before_end")) {
-                            int32_t val = j["min_tokens_before_end"].get<int32_t>();
-                            pipelineParams.gen.min_tokens_before_end = std::max(0, val);
-                        }
-
-                        if (j.contains("n_threads")) {
-                            int32_t val = j["n_threads"].get<int32_t>();
-                            pipelineParams.gen.n_threads = std::max(1, val);
-                        }
-
-                        if (j.contains("verbose")) {
-                            bool val = j["verbose"].get<bool>();
-                            pipelineParams.gen.verbose = val;
-                        }
-                    }
-                    catch (const json::parse_error& e) {
-                        json err = { {"error", "JSON parse error"} };
+                    std::string error_message;
+                    if (!apply_generate_params_json(req.form.get_field("params"), pipelineParams, error_message)) {
+                        json err = json_error(error_message);
                         res.set_content(err.dump(), "application/json");
                         res.status = 400;
                         return;
@@ -180,6 +202,72 @@ namespace s2
                 res.status = 200;
 
                 audio_free_memory_wav(&wav_buffer, &wav_size, nullptr); });
+
+        svr.Post("/clone", [&](const httplib::Request& req, httplib::Response& res)
+            {
+                PipelineParams pipelineParams = params.pipeline;
+
+                const std::string title = get_first_form_field(req.form, {"title", "voice_title"});
+                if (title.empty()) {
+                    res.status = 400;
+                    res.set_content(json_error("No title field in multipart form").dump(), "application/json");
+                    return;
+                }
+
+                const std::string transcript = get_first_form_field(
+                    req.form, {"transcript", "reference_text", "ref_text", "prompt_text"});
+                if (transcript.empty()) {
+                    res.status = 400;
+                    res.set_content(json_error("No transcript field in multipart form").dump(), "application/json");
+                    return;
+                }
+
+                httplib::FormData ref_file;
+                if (!get_first_form_file(req.form, {"file", "reference", "reference_audio", "prompt_audio", "ref_audio"}, ref_file) ||
+                    ref_file.content.empty()) {
+                    res.status = 400;
+                    res.set_content(json_error("No file field in multipart form").dump(), "application/json");
+                    return;
+                }
+
+                VoiceCloneResult clone_result;
+                const auto start = std::chrono::steady_clock::now();
+                if (!pipeline.clone_voice_from_memory(pipelineParams,
+                                                      ref_file.content.data(),
+                                                      ref_file.content.size(),
+                                                      title,
+                                                      transcript,
+                                                      clone_result)) {
+                    res.status = 400;
+                    res.set_content(json_error("Voice cloning failed.").dump(), "application/json");
+                    return;
+                }
+
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+
+                json response = {
+                    {"voice_id", clone_result.voice_id},
+                    {"title", clone_result.title},
+                    {"created_at", clone_result.created_at},
+                    {"profile_filename", clone_result.profile_filename},
+                    {"audio_bytes", ref_file.content.size()},
+                    {"profile_bytes", clone_result.profile_size_bytes},
+                    {"transcript_bytes", clone_result.transcript_bytes},
+                    {"prompt_frames", clone_result.prompt_frames},
+                    {"sample_rate", clone_result.sample_rate},
+                    {"codebook_size", clone_result.codebook_size},
+                    {"num_codebooks", clone_result.num_codebooks},
+                    {"elapsed_ms", elapsed_ms}
+                };
+
+                if (!ref_file.filename.empty()) {
+                    response["source_filename"] = ref_file.filename;
+                }
+
+                res.status = 201;
+                res.set_content(response.dump(), "application/json");
+            });
 
         std::cout << "Server starting on http://" << params.host << ":" << params.port << "..." << std::endl;
 

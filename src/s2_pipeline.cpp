@@ -1,7 +1,14 @@
 #include "../include/s2_pipeline.h"
 #include "../include/s2_gguf.h"
+#include "../third_party/filesystem.hpp"
+
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cmath>
+#include <ctime>
+
+namespace fs = ghc::filesystem;
 
 namespace s2 {
 
@@ -13,6 +20,29 @@ static void safe_print_ln(const std::string& msg) {
 static void safe_print_error_ln(const std::string& msg) {
     fputs(msg.c_str(), stderr);
     fputc('\n', stderr);
+}
+
+static std::string slugify_voice_title(const std::string & title) {
+    return title;
+}
+
+static std::string build_voice_profile_path(const std::string & storage_dir,
+                                            const std::string & voice_id) {
+    return (fs::path(storage_dir) / (voice_id + ".s2voice")).string();
+}
+
+static bool is_valid_voice_id(const std::string & voice_id) {
+    if (voice_id.empty() || voice_id == "." || voice_id == "..") {
+        return false;
+    }
+
+    for (unsigned char ch : voice_id) {
+        if (ch == '/' || ch == '\\' || std::iscntrl(ch)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 Pipeline::Pipeline() {}
@@ -141,6 +171,79 @@ bool Pipeline::synthesize_to_memory(const PipelineParams & params, void** ref_au
     return true;
 }
 
+bool Pipeline::clone_voice_from_memory(const PipelineParams & params,
+                                       const void * ref_audio_buffer,
+                                       size_t ref_audio_size,
+                                       const std::string & voice_title,
+                                       const std::string & transcript,
+                                       VoiceCloneResult & result) {
+    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+
+    if (!initialized_) {
+        safe_print_error_ln("Pipeline not initialized.");
+        return false;
+    }
+
+    if (!ref_audio_buffer || ref_audio_size == 0) {
+        safe_print_error_ln("Pipeline error: clone requested without audio data.");
+        return false;
+    }
+
+    if (voice_title.empty()) {
+        safe_print_error_ln("Pipeline error: clone requested without voice title.");
+        return false;
+    }
+
+    if (transcript.empty()) {
+        safe_print_error_ln("Pipeline error: clone requested without transcript.");
+        return false;
+    }
+
+    AudioData ref_audio;
+    if (!load_audio_from_memory(ref_audio_buffer, ref_audio_size, ref_audio, codec_.sample_rate())) {
+        safe_print_error_ln("Pipeline error: failed to decode reference audio for cloning.");
+        return false;
+    }
+
+    voice_mgr_.set_storage_dir(params.voice_storage_dir);
+
+    std::vector<int32_t> ref_codes;
+    int32_t T_prompt = 0;
+    if (!codec_.encode(ref_audio.samples.data(), static_cast<int32_t>(ref_audio.samples.size()),
+                       params.gen.n_threads, ref_codes, T_prompt)) {
+        safe_print_error_ln("Pipeline error: failed to encode reference audio for cloning.");
+        return false;
+    }
+
+    const std::string voice_id = slugify_voice_title(voice_title);
+    if (!is_valid_voice_id(voice_id)) {
+        safe_print_error_ln("Pipeline error: invalid voice title for profile filename.");
+        return false;
+    }
+
+    if (!save_voice_profile(voice_id, ref_codes, T_prompt, transcript, params)) {
+        return false;
+    }
+
+    const std::string storage_path = build_voice_profile_path(params.voice_storage_dir, voice_id);
+    std::error_code file_error;
+    const auto profile_size = fs::file_size(storage_path, file_error);
+    const std::time_t now = std::time(nullptr);
+
+    result.voice_id = voice_id;
+    result.title = voice_title;
+    result.created_at = static_cast<int64_t>(now);
+    result.profile_filename = voice_id + ".s2voice";
+    result.storage_path = storage_path;
+    result.profile_size_bytes = file_error ? 0 : static_cast<size_t>(profile_size);
+    result.transcript_bytes = transcript.size();
+    result.prompt_frames = T_prompt;
+    result.sample_rate = codec_.sample_rate();
+    result.codebook_size = model_.hparams().codebook_size;
+    result.num_codebooks = model_.hparams().num_codebooks;
+    return true;
+}
+
 bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_audio, std::vector<float>& audio_out) {
     std::lock_guard<std::mutex> lock(synthesize_mutex_);
 
@@ -249,9 +352,7 @@ bool Pipeline::save_voice_profile(const std::string & voice_id,
     
     // Simple timestamp
     std::time_t now = std::time(nullptr);
-    char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-    profile.timestamp = buf;
+    profile.timestamp = std::to_string(static_cast<int64_t>(now));
     
     if (voice_mgr_.save(voice_id, profile)) {
         safe_print_ln("Saved voice profile: " + voice_id);

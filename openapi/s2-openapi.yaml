@@ -3,7 +3,7 @@ info:
   title: s2.cpp HTTP Server API
   description: |
     HTTP server for Fish Audio S2 Pro text-to-speech inference engine.
-    Provides a single endpoint for generating speech from text with optional voice cloning.
+    Provides speech generation and persistent voice-cloning endpoints.
   version: 1.0.0
   contact:
     name: s2.cpp project
@@ -37,6 +37,13 @@ paths:
                   type: string
                   description: Text to synthesize (required)
                   example: "Hello, world!"
+                voice:
+                  type: string
+                  description: |
+                    Saved voice profile id to reuse.
+                    Alias: voice_id.
+                    If reference audio is also provided, the uploaded reference audio takes precedence.
+                  example: "alice"
                 reference_text:
                   type: string
                   description: |
@@ -89,6 +96,60 @@ paths:
             text/plain:
               schema:
                 type: string
+  /clone:
+    post:
+      summary: Clone and persist a voice profile
+      description: |
+        Encode the uploaded reference audio into a persistent `.s2voice` profile stored under the server voice directory.
+        Request must be multipart/form-data.
+      operationId: cloneVoice
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - title
+                - transcript
+                - file
+              properties:
+                title:
+                  type: string
+                  description: Human-readable title for the voice profile
+                  example: Alice
+                transcript:
+                  type: string
+                  description: |
+                    Transcript of the uploaded reference audio.
+                    Aliases: reference_text, ref_text, prompt_text.
+                  example: This is a reference audio transcript.
+                file:
+                  type: string
+                  format: binary
+                  description: |
+                    Reference audio file to encode into the saved voice profile.
+                    Supported aliases: reference, reference_audio, prompt_audio, ref_audio.
+              additionalProperties: false
+      responses:
+        '201':
+          description: Voice profile created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloneVoiceResponse'
+        '400':
+          description: Bad request (missing required field, invalid audio, clone failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
 components:
   schemas:
@@ -143,6 +204,74 @@ components:
           type: boolean
           default: true
           description: Enable verbose logging
+    CloneVoiceResponse:
+      type: object
+      required:
+        - voice_id
+        - title
+        - profile_filename
+        - audio_bytes
+        - profile_bytes
+        - transcript_bytes
+        - prompt_frames
+        - sample_rate
+        - codebook_size
+        - num_codebooks
+        - elapsed_ms
+      properties:
+        voice_id:
+          type: string
+          description: Saved voice profile id to pass to `/generate`
+          example: alice
+        title:
+          type: string
+          description: Voice title supplied by the client
+          example: alice
+        created_at:
+          type: integer
+          format: int64
+          description: Unix timestamp in seconds when the profile was created
+          example: 1774971738
+        profile_filename:
+          type: string
+          description: Saved voice profile filename on disk
+          example: alice.s2voice
+        source_filename:
+          type: string
+          description: Original uploaded filename when provided by the client
+          example: reference.wav
+        audio_bytes:
+          type: integer
+          minimum: 0
+          description: Uploaded reference audio size in bytes
+        profile_bytes:
+          type: integer
+          minimum: 0
+          description: Saved `.s2voice` profile size in bytes
+        transcript_bytes:
+          type: integer
+          minimum: 0
+          description: Transcript byte length
+        prompt_frames:
+          type: integer
+          minimum: 0
+          description: Number of encoded prompt frames stored in the profile
+        sample_rate:
+          type: integer
+          minimum: 1
+          description: Codec sample rate used for compatibility checks
+        codebook_size:
+          type: integer
+          minimum: 1
+          description: Codec codebook size stored in the profile metadata
+        num_codebooks:
+          type: integer
+          minimum: 1
+          description: Number of codebooks stored in the profile metadata
+        elapsed_ms:
+          type: integer
+          minimum: 0
+          description: End-to-end clone request duration in milliseconds
 
 tags:
   - name: Speech
